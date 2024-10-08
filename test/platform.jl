@@ -2,14 +2,9 @@
     @testset "Info" begin
         @test length(cl.platforms()) == cl.num_platforms()
 
-        @test platform != nothing
-        @test pointer(platform) != C_NULL
-        for k in [:profile, :version, :name, :vendor, :extensions]
-            @test platform[k] == cl.info(platform, k)
-        end
-        v = opencl_version(platform)
-        @test 1 <= v.major <= 3
-        @test 0 <= v.minor <= 2
+        @test cl.platform() != nothing
+        @test pointer(cl.platform()) != C_NULL
+        @test cl.platform().opencl_version isa VersionNumber
     end
 
     @testset "Equality" begin

@@ -1,25 +1,3 @@
-export create_compute_context, opencl_version
-
-function create_compute_context()
-    ctx    = create_some_context()
-    device = first(devices(ctx))
-    queue  = cl.CmdQueue(ctx)
-    return (device, ctx, queue)
-end
-
-function parse_version(version_string)
-    mg = match(r"^OpenCL ([0-9]+)\.([0-9]+) .*$", version_string)
-    if mg === nothing
-        error("Non conforming version string: $(ver)")
-    end
-    return VersionNumber(parse(Int, mg.captures[1]),
-                                 parse(Int, mg.captures[2]))
-end
-
-opencl_version(obj::CLObject) = parse_version(obj[:version])
-opencl_version(c::cl.Context)  = opencl_version(first(cl.devices(c)))
-opencl_version(q::cl.CmdQueue) = opencl_version(q[:device])
-
 """
 Format string using dict-like variables, replacing all accurancies of
 `%(key)` with `value`.
@@ -35,25 +13,72 @@ function format(s::String; vars...)
     s
 end
 
-function build_kernel(ctx::cl.Context, program::String,
-                      kernel_name::String; vars...)
+function build_kernel(program::String, kernel_name::String; vars...)
     src = format(program; vars...)
-    p = cl.Program(ctx, source=src)
+    p = cl.Program(source=src)
     cl.build!(p)
     return cl.Kernel(p, kernel_name)
 end
 
-# cache for kernels; dict of form `(program_file, kernel_name, vars) -> kernel`
-const CACHED_KERNELS = Dict{Tuple{String, String, Dict}, cl.Kernel}()
-
-function get_kernel(ctx::cl.Context, program_file::String,
-                    kernel_name::String; vars...)
-    key = (program_file, kernel_name, Dict(vars))
+const CACHED_KERNELS = Dict{Any, cl.Kernel}()
+function get_kernel(program_file::String, kernel_name::String; vars...)
+    key = (cl.context(), program_file, kernel_name, Dict(vars))
     if in(key, keys(CACHED_KERNELS))
         return CACHED_KERNELS[key]
     else
-        kernel = build_kernel(ctx, read(program_file, String), kernel_name; vars...)
+        kernel = build_kernel(read(program_file, String), kernel_name; vars...)
         CACHED_KERNELS[key] = kernel
         return kernel
+    end
+end
+
+function versioninfo(io::IO=stdout)
+    println(io, "OpenCL.jl version $(pkgversion(@__MODULE__))")
+    println(io)
+
+    println(io, "Toolchain:")
+    println(io, " - Julia v$(VERSION)")
+    for pkg in [cl.OpenCL_jll]
+        println(io, " - $(string(pkg)) v$(pkgversion(pkg))")
+    end
+    println(io)
+
+    env = filter(var->startswith(var, "JULIA_OPENCL"), keys(ENV))
+    if !isempty(env)
+        println(io, "Environment:")
+        for var in env
+            println(io, "- $var: $(ENV[var])")
+        end
+        println(io)
+    end
+
+    println(io, "Available platforms: ", length(cl.platforms()))
+    for platform in cl.platforms()
+        println(io, " - $(platform.name)")
+        print(io, "   OpenCL $(platform.opencl_version.major).$(platform.opencl_version.minor)")
+        if !isempty(platform.version)
+            print(io, ", $(platform.version)")
+        end
+        println(io)
+
+        for device in cl.devices(platform)
+            print(io, "   · $(device.name)")
+
+            ## list some relevant extensions
+            extensions = []
+            if in("cl_khr_fp16", device.extensions)
+                push!(extensions, "fp16")
+            end
+            if in("cl_khr_fp64", device.extensions)
+                push!(extensions, "fp64")
+            end
+            if in("cl_khr_il_program", device.extensions)
+                push!(extensions, "il")
+            end
+            if !isempty(extensions)
+                print(io, " (", join(extensions, ", "), ")")
+            end
+            println(io)
+        end
     end
 end

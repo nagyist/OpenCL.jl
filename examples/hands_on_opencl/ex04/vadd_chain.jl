@@ -40,13 +40,8 @@ __kernel void vadd(
 
 # create a compute context
 
-# this selects the fastest opencl device available
-# and creates a context and queue for using the
-# the selected device
-device, ctx, queue = cl.create_compute_context()
-
 # create the compute program and build it
-program = cl.Program(ctx, source=kernelsource) |> cl.build!
+program = cl.Program(source=kernelsource) |> cl.build!
 
 #create a, b, e, and g vectors and fill with random float values
 #create empty vectors for c, d, and f
@@ -67,37 +62,35 @@ h_g = rand(Float32, LENGTH)
 # {:use (use host buffer), :alloc (alloc pinned memory), :copy (default)}
 
 # Create the input (a, b, e, g) arrays in device memory and copy data from host
-d_a = cl.Buffer(Float32, ctx, length(h_a), (:r, :copy), hostbuf=h_a)
-d_b = cl.Buffer(Float32, ctx, length(h_b), (:r, :copy), hostbuf=h_b)
-d_e = cl.Buffer(Float32, ctx, length(h_e), (:r, :copy), hostbuf=h_e)
-d_g = cl.Buffer(Float32, ctx, length(h_g), (:r, :copy), hostbuf=h_g)
+d_a = CLArray(h_a; access=:r)
+d_b = CLArray(h_b; access=:r)
+d_e = CLArray(h_e; access=:r)
+d_g = CLArray(h_g; access=:r)
 # Create the output (c, d, f) array in device memory
-d_c = cl.Buffer(Float32, ctx, :LENGTH, w)
-d_d = cl.Buffer(Float32, ctx, :LENGTH, w)
-d_f = cl.Buffer(Float32, ctx, :LENGTH, w)
+d_c = CLArray{Float32}(undef, LENGTH; access=:w)
+d_d = CLArray{Float32}(undef, LENGTH; access=:w)
+d_f = CLArray{Float32}(undef, LENGTH; access=:w)
 
 # create the kernel
 vadd = cl.Kernel(program, "vadd")
 
 # execute the kernel over the entire range of 1d input
-# calling `queue` is blocking, it accepts the kernel, global / local work sizes,
+# calling `queue` is asynchronous, it accepts the kernel, global / local work sizes,
 # the the kernel's arguments.
 
-# here we call the kernel with work size set to the number of elements and a local
-# work size of nothing. This enables the opencl runtime to optimize the local size
-# for simple kernels
-queue(vadd, size(h_a), nothing, d_a, d_b, d_c, UInt32(LENGTH))
-
-# an alternative syntax is to create an partial function to call
-# by julia's getindex syntax for Kernel types.
-# here the queue, global_size, and (optional) local_size are passed in which
-# returns a partial function with these parameters set.
-vadd[queue, size(h_e)](d_e, d_c, d_d, UInt32(LENGTH))
-vadd[queue, size(h_g)](d_g, d_d, d_f, UInt32(LENGTH))
+# here we call the kernel with work size set to the number of elements and no local
+# work size. This enables the opencl runtime to optimize the local size for simple
+# kernels
+clcall(vadd, Tuple{Ptr{Float32}, Ptr{Float32}, Ptr{Float32}, Cuint},
+       d_a, d_b, d_c, LENGTH; global_size=size(h_a))
+clcall(vadd, Tuple{Ptr{Float32}, Ptr{Float32}, Ptr{Float32}, Cuint},
+       d_e, d_c, d_d, LENGTH; global_size=size(h_e))
+clcall(vadd, Tuple{Ptr{Float32}, Ptr{Float32}, Ptr{Float32}, Cuint},
+       d_g, d_d, d_f, LENGTH; global_size=size(h_g))
 
 # copy back the results from the compute device
 # copy!(queue, dst, src) follows same interface as julia's built in copy!
-cl.copy!(queue, h_f, d_f)
+copy!(h_f, d_f)
 
 # test the results
 correct = 0

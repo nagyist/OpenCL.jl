@@ -1,37 +1,34 @@
-if backend in ["POCL", "Intel"]
+if contains(cl.platform().vendor, "Intel") || contains(cl.platform().vendor, "pocl")
     # unsupported by POCL
     # hangs on Intel
-    @warn "Skipping event tests"
+    @warn "Skipping event tests on $(cl.platform().name)"
 else
 @testset "Event" begin
     @testset "status" begin
-        ctx = cl.Context(device)
-        evt = cl.UserEvent(ctx)
-        evt[:status]
-        @test evt[:status] == :submitted
+        evt = cl.UserEvent()
+        evt.status
+        @test evt.status == :submitted
         cl.complete(evt)
-        @test evt[:status] == :complete
+        @test evt.status == :complete
         finalize(evt)
     end
 
     @testset "wait" begin
-        ctx = cl.Context(device)
         # create user event
-        usr_evt = cl.UserEvent(ctx)
-        q = cl.CmdQueue(ctx)
-        cl.enqueue_wait_for_events(q, usr_evt)
+        usr_evt = cl.UserEvent()
+        cl.enqueue_wait_for_events(usr_evt)
 
         # create marker event
-        mkr_evt = cl.enqueue_marker(q)
+        mkr_evt = cl.enqueue_marker()
 
-        @test usr_evt[:status] == :submitted
-        @test mkr_evt[:status] in (:queued, :submitted)
+        @test usr_evt.status == :submitted
+        @test mkr_evt.status in (:queued, :submitted)
 
         cl.complete(usr_evt)
-        @test usr_evt[:status] == :complete
+        @test usr_evt.status == :complete
 
-        cl.wait(mkr_evt)
-        @test mkr_evt[:status] == :complete
+        wait(mkr_evt)
+        @test mkr_evt.status == :complete
 
         @test cl.cl_event_status(:running) == cl.CL_RUNNING
         @test cl.cl_event_status(:submitted) == cl.CL_SUBMITTED
@@ -46,29 +43,27 @@ else
             callback_called[] = true
         end
 
-        ctx = cl.Context(device)
-        usr_evt = cl.UserEvent(ctx)
-        queue = cl.CmdQueue(ctx)
+        usr_evt = cl.UserEvent()
 
-        cl.enqueue_wait_for_events(queue, usr_evt)
+        cl.enqueue_wait_for_events(usr_evt)
 
-        mkr_evt = cl.enqueue_marker(queue)
+        mkr_evt = cl.enqueue_marker()
         cl.add_callback(mkr_evt, test_callback)
 
-        @test usr_evt[:status] == :submitted
-        @test mkr_evt[:status] in (:queued, :submitted)
+        @test usr_evt.status == :submitted
+        @test mkr_evt.status in (:queued, :submitted)
         @test !callback_called[]
 
         cl.complete(usr_evt)
-        @test usr_evt[:status] == :complete
+        @test usr_evt.status == :complete
 
-        cl.wait(mkr_evt)
+        wait(mkr_evt)
 
         # Give callback some time to finish
         yield()
         sleep(0.5)
 
-        @test mkr_evt[:status] == :complete
+        @test mkr_evt.status == :complete
         @test callback_called[]
     end
 end

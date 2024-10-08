@@ -69,7 +69,7 @@ function retry_reclaim(f, isfailed)
     ret
 end
 
-include("../lib/libopencl.jl")
+include("libopencl.jl")
 
 # lazy initialization
 const initialized = Ref{Bool}(false)
@@ -82,7 +82,12 @@ const initialized = Ref{Bool}(false)
         return
     end
 
-    withenv("OCL_ICD_FILENAMES"=>join(OpenCL_jll.drivers, ':')) do
+    ocd_filenames = join(OpenCL_jll.drivers, ':')
+    if haskey(ENV, "OCL_ICD_FILENAMES")
+        ocd_filenames *= ":" * ENV["OCL_ICD_FILENAMES"]
+    end
+
+    withenv("OCL_ICD_FILENAMES"=>ocd_filenames) do
         num_platforms = Ref{Cuint}()
         @ccall libopencl.clGetPlatformIDs(
             0::cl_uint, C_NULL::Ptr{cl_platform_id},
@@ -94,7 +99,22 @@ function __init__()
     if !OpenCL_jll.is_available()
         @error "OpenCL_jll is not available for your platform, OpenCL.jl. will not work."
     end
+
+    # ensure that operations executed by the REPL back-end finish before returning,
+    # because displaying values happens on a different task
+    if isdefined(Base, :active_repl_backend) && !isnothing(Base.active_repl_backend)
+        push!(Base.active_repl_backend.ast_transforms, synchronize_opencl_tasks)
+    end
 end
 
-const _versionDict = Dict{Ptr, VersionNumber}()
-_deletecached!(obj::CLObject) = delete!(_versionDict, pointer(obj))
+function synchronize_opencl_tasks(ex)
+    quote
+        try
+            $(ex)
+        finally
+            if haskey($task_local_storage(), :CLDevice)
+                $device_synchronize()
+            end
+        end
+    end
+end

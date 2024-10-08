@@ -1,156 +1,296 @@
 import LinearAlgebra
 
-export CLArray, CLMatrix, CLVector, to_host
+export CLArray, CLMatrix, CLVector, buffer
 
-mutable struct CLArray{T, N} <: CLObject
+mutable struct CLArray{T, N} <: AbstractGPUArray{T, N}
     ctx::cl.Context
-    queue::cl.CmdQueue
-    buffer::cl.Buffer{T}
-    size::NTuple{N, Int}
+
+    data::DataRef{cl.SVMBuffer{UInt8}}
+    offset::Int # offset in number of elements
+
+    dims::NTuple{N, Int}
+
+    # allocating constructor
+    function CLArray{T,N}(::UndefInitializer, dims::Dims{N}; access=:rw) where {T,N}
+        buf = cl.SVMBuffer{UInt8}(prod(dims) * sizeof(T), access)
+        ref = DataRef(identity, buf)
+        new(cl.context(), ref, 0, dims)
+    end
+
+    # low-level constructor for wrapping existing data
+    function CLArray{T,N}(ref::DataRef{cl.SVMBuffer{UInt8}}, dims::Dims;
+                          offset::Int=0) where {T,N}
+        new(cl.context(), ref, offset, dims)
+    end
 end
+
+
+## convenience constructors
 
 const CLMatrix{T} = CLArray{T,2}
 const CLVector{T} = CLArray{T,1}
 
-## constructors
+# type and dimensionality specified
+CLArray{T,N}(::UndefInitializer, dims::NTuple{N,Integer}; kwargs...) where {T,N} =
+  CLArray{T,N}(undef, convert(Tuple{Vararg{Int}}, dims); kwargs...)
+CLArray{T,N}(::UndefInitializer, dims::Vararg{Integer,N}; kwargs...) where {T,N} =
+  CLArray{T,N}(undef, convert(Tuple{Vararg{Int}}, dims); kwargs...)
 
-function CLArray(buf::cl.Buffer{T}, queue::cl.CmdQueue, sz::Tuple{Vararg{Int}}) where T
-    ctx = cl.context(buf)
-    CLArray(ctx, queue, buf, sz)
+# type but not dimensionality specified
+CLArray{T}(::UndefInitializer, dims::NTuple{N,Integer}; kwargs...) where {T,N} =
+  CLArray{T,N}(undef, convert(Tuple{Vararg{Int}}, dims); kwargs...)
+CLArray{T}(::UndefInitializer, dims::Vararg{Integer,N}; kwargs...) where {T,N} =
+  CLArray{T,N}(undef, convert(Tuple{Vararg{Int}}, dims); kwargs...)
+
+# empty vector constructor
+CLArray{T,1}() where {T} = CLArray{T,1}(undef, 0)
+
+Base.similar(a::CLArray{T,N}; kwargs...) where {T,N} =
+  CLArray{T,N}(undef, size(a); kwargs...)
+Base.similar(a::CLArray{T}, dims::Base.Dims{N}; kwargs...) where {T,N} =
+  CLArray{T,N}(undef, dims; kwargs...)
+Base.similar(a::CLArray, ::Type{T}, dims::Base.Dims{N}; kwargs...) where {T,N} =
+  CLArray{T,N}(undef, dims; kwargs...)
+
+function Base.copy(a::CLArray{T,N}; kwargs...) where {T,N}
+  b = similar(a; kwargs...)
+  @inbounds copyto!(b, a)
 end
 
-function CLArray(queue::cl.CmdQueue,
-                 flags::Tuple{Vararg{Symbol}},
-                 hostarray::AbstractArray{T,N}) where {T, N}
-    ctx = cl.context(queue)
-    buf = cl.Buffer(T, ctx, length(hostarray), flags, hostbuf=hostarray)
-    sz = size(hostarray)
-    CLArray(ctx, queue, buf, sz)
+function Base.deepcopy_internal(x::CLArray, dict::IdDict)
+  haskey(dict, x) && return dict[x]::typeof(x)
+  return dict[x] = copy(x)
 end
 
-CLArray(queue::cl.CmdQueue, hostarray::AbstractArray{T,N};
-        flags=(:rw, :copy)) where {T, N} = CLArray(queue, (:rw, :copy), hostarray)
 
-Base.copy(A::CLArray; ctx=A.ctx, queue=A.queue,
-          buffer=A.buffer, size=A.size) = CLArray(ctx, queue, buffer, size)
+## array interface
 
-function Base.deepcopy(A::CLArray{T,N}) where {T, N}
-    new_buf = cl.Buffer(T, A.ctx, prod(A.size))
-    copy!(A.queue, new_buf, A.buffer)
-    return CLArray(A.ctx, A.queue, new_buf, A.size)
+context(A::CLArray) = A.ctx
+buffer(A::CLArray) = A.data[]
+
+Base.elsize(::Type{<:CLArray{T}}) where {T} = sizeof(T)
+
+Base.size(x::CLArray) = x.dims
+Base.sizeof(x::CLArray) = Base.elsize(x) * length(x)
+
+Base.unsafe_convert(::Type{Ptr{T}}, x::CLArray{T}) where {T} =
+    convert(Ptr{T}, pointer(x.data[])) + x.offset*Base.elsize(x)
+
+Base.:(==)(A::CLArray, B::CLArray) = Array(A) == Array(B)
+
+
+## derived types
+
+export DenseCLArray, DenseJLVector, DenseJLMatrix, DenseJLVecOrMat,
+       StridedCLArray, StridedJLVector, StridedJLMatrix, StridedJLVecOrMat,
+       AnyCLArray, AnyJLVector, AnyJLMatrix, AnyJLVecOrMat
+
+# dense arrays: stored contiguously in memory
+DenseCLArray{T,N} = CLArray{T,N}
+DenseJLVector{T} = DenseCLArray{T,1}
+DenseJLMatrix{T} = DenseCLArray{T,2}
+DenseJLVecOrMat{T} = Union{DenseJLVector{T}, DenseJLMatrix{T}}
+
+# strided arrays
+StridedSubCLArray{T,N,I<:Tuple{Vararg{Union{Base.RangeIndex, Base.ReshapedUnitRange,
+                                            Base.AbstractCartesianIndex}}}} =
+  SubArray{T,N,<:CLArray,I}
+StridedCLArray{T,N} = Union{CLArray{T,N}, StridedSubCLArray{T,N}}
+StridedJLVector{T} = StridedCLArray{T,1}
+StridedJLMatrix{T} = StridedCLArray{T,2}
+StridedJLVecOrMat{T} = Union{StridedJLVector{T}, StridedJLMatrix{T}}
+
+Base.pointer(x::StridedCLArray{T}) where {T} = Base.unsafe_convert(Ptr{T}, x)
+@inline function Base.pointer(x::StridedCLArray{T}, i::Integer) where T
+    Base.unsafe_convert(Ptr{T}, x) + Base._memory_offset(x, i)
 end
+
+# anything that's (secretly) backed by a CLArray
+AnyCLArray{T,N} = Union{CLArray{T,N}, WrappedArray{T,N,CLArray,CLArray{T,N}}}
+AnyJLVector{T} = AnyCLArray{T,1}
+AnyJLMatrix{T} = AnyCLArray{T,2}
+AnyJLVecOrMat{T} = Union{AnyJLVector{T}, AnyJLMatrix{T}}
+
+
+## conversions
+
+function CLArray{T,N}(hostarray::AbstractArray; kwargs...) where {T, N}
+    arr = CLArray{T,N}(undef, size(hostarray); kwargs...)
+    copyto!(arr, convert(Array{T}, hostarray))
+    return arr
+end
+CLArray{T}(xs::AbstractArray{<:Any,N}; kwargs...) where {T,N} = CLArray{T,N}(xs; kwargs...)
+CLArray(A::AbstractArray{T,N}; kwargs...) where {T,N} = CLArray{T,N}(A; kwargs...)
+
+function Base.Array{T,N}(A::CLArray{T,N}) where {T,N}
+    hA = Array{T}(undef, size(A)...)
+    copyto!(hA, A)
+    return hA
+end
+
+function Base.cconvert(::Type{Ptr{T}}, A::CLArray{T}) where T
+    buffer(A)
+end
+
+function Adapt.adapt_storage(to::KernelAdaptor, xs::CLArray{T,N}) where {T,N}
+    CLDeviceArray{T,N,AS.Global}(size(xs), reinterpret(LLVMPtr{T,AS.Global}, pointer(xs)))
+end
+
+
+## utilities
 
 """
 Create in device memory array of type `t` and size `dims` filled by value `x`.
 """
-function Base.fill(::Type{T}, q::cl.CmdQueue, x::T, dims...) where T
-    ctx = cl.info(q, :context)
-    v = opencl_version(ctx)
-    if v.major == 1 && v.minor >= 2
-        buf = cl.Buffer(T, ctx, prod(dims))
-        fill!(q, buf, x)
-    else
-        buf = cl.Buffer(T, ctx, prod(dims), (:rw, :copy), hostbuf=fill(x, dims))
+function fill(x::T, dims) where T
+    A = CLArray{T}(undef, dims)
+    fill!(A, x)
+end
+fill(x, dims...) = fill(x, (dims...,))
+
+function Base.fill!(A::CLArray{T}, x::T) where {T}
+    isempty(A) || cl.enqueue_svm_fill(pointer(A), x, length(A))
+    A
+end
+
+zeros(::Type{T}, dims...) where {T} = fill(zero(T), dims...)
+zeros(dims...) = fill(Float64(0), dims...)
+ones(::Type{T}, dims...) where {T} = fill(one(T), dims...)
+ones(dims...) = fill(Float64(1), dims...)
+
+
+## memory copying
+
+typetagdata(a::Array, i=1) = ccall(:jl_array_typetagdata, Ptr{UInt8}, (Any,), a) + i - 1
+typetagdata(a::CLArray, i=1) =
+  convert(ZePtr{UInt8}, a.data[]) + a.maxsize + a.offset + i - 1
+
+function Base.copyto!(dest::CLArray{T}, doffs::Int, src::Array{T}, soffs::Int,
+                      n::Int) where T
+  (n == 0 || sizeof(T) == 0) && return dest
+  @boundscheck checkbounds(dest, doffs)
+  @boundscheck checkbounds(dest, doffs+n-1)
+  @boundscheck checkbounds(src, soffs)
+  @boundscheck checkbounds(src, soffs+n-1)
+  unsafe_copyto!(dest, doffs, src, soffs, n)
+  # device->host copies need to be blocking, because the user will expect the
+  # values to be available
+  return dest
+end
+
+Base.copyto!(dest::CLArray{T}, src::Array{T}) where {T} =
+    copyto!(dest, 1, src, 1, length(src))
+
+function Base.copyto!(dest::Array{T}, doffs::Int, src::CLArray{T}, soffs::Int,
+                      n::Int) where T
+  (n == 0 || sizeof(T) == 0) && return dest
+  @boundscheck checkbounds(dest, doffs)
+  @boundscheck checkbounds(dest, doffs+n-1)
+  @boundscheck checkbounds(src, soffs)
+  @boundscheck checkbounds(src, soffs+n-1)
+  unsafe_copyto!(dest, doffs, src, soffs, n)
+  # host->device copies need to be blocking, because otherwise the host memory
+  # can be modified or even freed before the asynchronous copy finishes
+  #
+  # TODO: this is bad for performance, so we should probably:
+  # - expose `blocking=false`/`async=true` to the user, so that
+  #   they can promise the buffer won't be freed or mutated behind our back
+  # - use a staging buffer to perform a host->host copy first;
+  #   probably only for small buffers.
+  return dest
+end
+Base.copyto!(dest::Array{T}, src::CLArray{T}) where {T} =
+    copyto!(dest, 1, src, 1, length(src))
+
+function Base.copyto!(dest::CLArray{T}, doffs::Int, src::CLArray{T}, soffs::Int,
+                      n::Int) where T
+  (n == 0 || sizeof(T) == 0) && return dest
+  @boundscheck checkbounds(dest, doffs)
+  @boundscheck checkbounds(dest, doffs+n-1)
+  @boundscheck checkbounds(src, soffs)
+  @boundscheck checkbounds(src, soffs+n-1)
+  @assert context(dest) == context(src)
+  unsafe_copyto!(dest, doffs, src, soffs, n; blocking=false)
+  # device->device copies can be asynchronous
+  return dest
+end
+Base.copyto!(dest::CLArray{T}, src::CLArray{T}) where {T} =
+    copyto!(dest, 1, src, 1, length(src))
+
+for (srcty, dstty) in [(:Array, :CLArray), (:CLArray, :Array), (:CLArray, :CLArray)]
+    @eval begin
+        function Base.unsafe_copyto!(dst::$dstty{T}, dst_off::Int,
+                                     src::$srcty{T}, src_off::Int,
+                                     N::Int; blocking::Bool=true) where T
+            nbytes = N * sizeof(T)
+            cl.enqueue_svm_memcpy(pointer(dst, dst_off), pointer(src, src_off), nbytes;
+                                  blocking)
+        end
+        Base.unsafe_copyto!(dst::$dstty, src::$srcty, N; kwargs...) =
+            unsafe_copyto!(dst, 1, src, 1, N; kwargs...)
     end
-    return CLArray(buf, q, dims)
 end
 
-Base.zeros(::Type{T}, q::cl.CmdQueue, dims...) where {T} = fill(T, q, T(0), dims...)
-Base.zeros(q::cl.CmdQueue, dims...) = fill(Float64, q, Float64(0), dims...)
-Base.ones(::Type{T}, q::cl.CmdQueue, dims...) where {T} = fill(T, q, T(1), dims...)
-Base.ones(q::cl.CmdQueue, dims...) = fill(Float64, q, Float64(1), dims...)
+
+## broadcasting
+
+using Base.Broadcast: BroadcastStyle, Broadcasted
+
+struct CLArrayStyle{N} <: AbstractGPUArrayStyle{N} end
+CLArrayStyle{M}(::Val{N}) where {N,M} = CLArrayStyle{N}()
+
+# identify the broadcast style of a (wrapped) array
+BroadcastStyle(::Type{<:CLArray{T,N}}) where {T,N} = CLArrayStyle{N}()
+BroadcastStyle(::Type{<:AnyCLArray{T,N}}) where {T,N} = CLArrayStyle{N}()
+
+# allocation of output arrays
+Base.similar(bc::Broadcasted{CLArrayStyle{N}}, ::Type{T}, dims) where {T,N} =
+    similar(CLArray{T}, dims)
 
 
-## core functions
+## regular gpu array adaptor
 
-buffer(A::CLArray) = A.buffer
-Base.pointer(A::CLArray) = A.buffer.id
-context(A::CLArray) = cl.context(A.buffer)
-queue(A::CLArray) = A.queue
-Base.eltype(A::CLArray{T, N}) where {T, N} = T
-Base.size(A::CLArray) = A.size
-Base.size(A::CLArray, dim::Integer) = A.size[dim]
-Base.ndims(A::CLArray) = length(size(A))
-Base.length(A::CLArray) = prod(size(A))
-Base.:(==)(A:: CLArray, B:: CLArray) =
-    buffer(A) == buffer(B) && size(A) == size(B)
-function Base.reshape(A::CLArray, dims...)
-    @assert prod(dims) == prod(size(A))
-    return copy(A, size=dims)
-end
+# We don't convert isbits types in `adapt`, since they are already
+# considered GPU-compatible.
 
-## show
+Adapt.adapt_storage(::Type{CLArray}, xs::AT) where {AT<:AbstractArray} =
+  isbitstype(AT) ? xs : convert(CLArray, xs)
 
-Base.show(io::IO, A::CLArray{T,N}) where {T, N} =
-    print(io, "CLArray{$T,$N}($(buffer(A)),$(size(A)))")
+# if specific type parameters are specified, preserve those
+Adapt.adapt_storage(::Type{<:CLArray{T}}, xs::AT) where {T, AT<:AbstractArray} =
+  isbitstype(AT) ? xs : convert(CLArray{T}, xs)
+Adapt.adapt_storage(::Type{<:CLArray{T, N}}, xs::AT) where {T, N, AT<:AbstractArray} =
+  isbitstype(AT) ? xs : convert(CLArray{T,N}, xs)
 
-## to_host
 
-function to_host(A::CLArray{T,N}; queue=A.queue) where {T, N}
-    hA = Array{T}(undef, size(A)...)
-    copy!(queue, hA, buffer(A))
-    return hA
-end
-
-## other array operations
-
-const TRANSPOSE_FLOAT_PROGRAM_PATH = joinpath(@__DIR__, "kernels", "transpose_float.cl")
-const TRANSPOSE_DOUBLE_PROGRAM_PATH = joinpath(@__DIR__, "kernels", "transpose_double.cl")
-
-function max_block_size(queue::cl.CmdQueue, h::Int, w::Int)
-    dev = cl.info(queue, :device)
-    dim1, dim2 = cl.info(dev, :max_work_item_size)[1:2]
-    wgsize = cl.info(dev, :max_work_group_size)
-    wglimit = floor(Int, sqrt(wgsize))
-    return gcd(dim1, dim2, h, w, wglimit)
-end
+## resizing
 
 """
-Transpose CLMatrix A, write result to a preallicated CLMatrix B
+  resize!(a::MtlVector, n::Integer)
+
+Resize `a` to contain `n` elements. If `n` is smaller than the current collection length,
+the first `n` elements will be retained. If `n` is larger, the new elements are not
+guaranteed to be initialized.
 """
-function LinearAlgebra.transpose!(B::CLMatrix{Float32}, A::CLMatrix{Float32};
-                                  queue=A.queue)
-    block_size = max_block_size(queue, size(A, 1), size(A, 2))
-    ctx = context(A)
-    kernel = get_kernel(ctx, TRANSPOSE_FLOAT_PROGRAM_PATH, "transpose",
-                        block_size=block_size)
-    h, w = size(A)
-    lmem = cl.LocalMem(Float32, block_size * (block_size + 1))
-    cl.set_args!(kernel, buffer(B), buffer(A), UInt32(h), UInt32(w), lmem)
-    return cl.enqueue_kernel(queue, kernel, (h, w), (block_size, block_size))
-end
+function Base.resize!(A::CLArray{T}, n::Integer) where T
+    # TODO: add additional space to allow for quicker resizing
+    nbytes = n * sizeof(T)
 
-"""Transpose CLMatrix A"""
-function LinearAlgebra.transpose(A::CLMatrix{Float32};
-                        queue=A.queue)
-    B = zeros(Float32, queue, reverse(size(A))...)
-    ev = LinearAlgebra.transpose!(B, A, queue=queue)
-    wait(ev)
-    return B
-end
-
-"""Transpose CLMatrix A, write result to a preallicated CLMatrix B"""
-function LinearAlgebra.transpose!(B::CLMatrix{Float64}, A::CLMatrix{Float64};
-                         queue=A.queue)
-    dev = cl.info(queue, :device)
-    if !in("cl_khr_fp64", cl.info(dev, :extensions))
-        throw(ArgumentError("Double precision not supported by device"))
+    # replace the data with a new one. this 'unshares' the array.
+    # as a result, we can safely support resizing unowned buffers.
+    buf = cl.device!(only(A.ctx.devices)) do
+        # XXX: preserve original access mode
+        cl.SVMBuffer{UInt8}(nbytes, :rw)
     end
-    block_size = max_block_size(queue, size(A, 1), size(A, 2))
-    ctx = context(A)
-    kernel = get_kernel(ctx, TRANSPOSE_DOUBLE_PROGRAM_PATH, "transpose",
-                          block_size=block_size)
-    h, w = size(A)
-    # lmem = cl.LocalMem(Float64, block_size * (block_size + 1))
-    lmem = cl.LocalMem(Float64, block_size * block_size)
-    cl.set_args!(kernel, buffer(B), buffer(A), UInt32(h), UInt32(w), lmem)
-    return cl.enqueue_kernel(queue, kernel, (h, w), (block_size, block_size))
-end
+    m = min(length(A), n)
+    if m > 0
+        cl.enqueue_svm_memcpy(pointer(buf), pointer(A), m*sizeof(T); blocking=false)
+    end
+    new_data = DataRef(identity, buf)
 
-"""Transpose CLMatrix A"""
-function LinearAlgebra.transpose(A::CLMatrix{Float64}; queue=A.queue)
-    B = zeros(Float64, queue, reverse(size(A))...)
-    ev = LinearAlgebra.transpose!(B, A, queue=queue)
-    cl.wait(ev)
-    return B
+    A.data = new_data
+    A.dims = (n,)
+    A.offset = 0
+
+    A
 end

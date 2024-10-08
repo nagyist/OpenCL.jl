@@ -1,213 +1,131 @@
-using Base.GC
+@testset "Buffer" begin
+    # simple buffer
+    let buf = cl.Buffer{Int}(1)
+        @test ndims(buf) == 1
+        @test eltype(buf) == Int
+        @test length(buf) == 1
+        @test sizeof(buf) == sizeof(Int)
+    end
 
-struct TestStruct
-    a::Cint
-    b::Cfloat
+    # memory copy
+    let buf = cl.Buffer{Int}(1)
+        src = [42]
+        cl.enqueue_write(buf, pointer(src), sizeof(src); blocking=true)
+
+        dst = [0]
+        cl.enqueue_read(pointer(dst), buf, sizeof(dst); blocking=true)
+        @test dst == [42]
+    end
+
+    # host accessible, mapped
+    let buf = cl.Buffer{Int}(1; host_accessible=true)
+        src = [42]
+        cl.enqueue_write(buf, pointer(src), sizeof(src); blocking=true)
+
+        ptr, evt = cl.enqueue_map(buf, sizeof(buf), :rw)
+        wait(evt)
+        mapped = unsafe_wrap(Array, convert(Ptr{Int}, ptr), 1; own=false)
+        @test mapped[] == 42
+        cl.enqueue_unmap(buf, ptr) |> wait
+    end
+
+    # re-use host buffer, without copy
+    let arr = [1,2,3]
+        buf = cl.Buffer(arr; copy=false)
+
+        dst = similar(arr)
+        cl.enqueue_read(pointer(dst), buf, sizeof(dst); blocking=true)
+        @test dst == arr
+
+        # we still need to map, despite copy=false
+        ptr, evt = cl.enqueue_map(buf, sizeof(buf), :rw)
+        wait(evt)
+        mapped_arr = unsafe_wrap(Array, convert(Ptr{Int}, ptr), 3; own=false)
+        mapped_arr .= 42
+        cl.enqueue_unmap(buf, ptr) |> wait
+
+        # but our pre-allocated buffer should have been updated too
+        @test arr == [42,42,42]
+
+        # and we can read it back
+        cl.enqueue_read(pointer(dst), buf, sizeof(dst); blocking=true)
+        @test dst == arr
+    end
+
+    # re-use host buffer, but copy
+    let arr = [1,2,3]
+        buf = cl.Buffer(arr; copy=true)
+
+        dst = similar(arr)
+        cl.enqueue_read(pointer(dst), buf, sizeof(dst); blocking=true)
+        @test dst == arr
+
+        arr .= 42
+
+        # but our pre-allocated buffer should not have been updated
+        cl.enqueue_read(pointer(dst), buf, sizeof(dst); blocking=true)
+        @test dst == [1,2,3]
+    end
+
+    # fill
+    let buf = cl.Buffer{Int}(3)
+        cl.enqueue_fill(buf, 42, 3)
+
+        arr = Vector{Int}(undef, 3)
+        cl.enqueue_read(pointer(arr), buf, sizeof(arr); blocking=true)
+        @test arr == [42,42,42]
+    end
 end
 
-@testset "Buffer" begin
-    @testset "constructors" begin
-        ctx = cl.Context(device)
-        testarray = zeros(Float32, 1000)
 
-        @test cl.Buffer(Float32, ctx, length(testarray),
-                        cl.CL_MEM_ALLOC_HOST_PTR | cl.CL_MEM_READ_ONLY) != nothing
-
-        @test cl.Buffer(Float32, ctx, length(testarray),
-                        cl.CL_MEM_ALLOC_HOST_PTR | cl.CL_MEM_WRITE_ONLY) != nothing
-
-        @test cl.Buffer(Float32, ctx, length(testarray),
-                        cl.CL_MEM_ALLOC_HOST_PTR | cl.CL_MEM_READ_WRITE) != nothing
-
-        buf = cl.Buffer(Float32, ctx, length(testarray),
-                        cl.CL_MEM_ALLOC_HOST_PTR | cl.CL_MEM_READ_WRITE)
-        @test length(buf) == length(testarray)
-
-        @test cl.Buffer(Float32, ctx, length(testarray),
-                        cl.CL_MEM_COPY_HOST_PTR | cl.CL_MEM_READ_ONLY;
-                        hostbuf=testarray) != nothing
-
-        @test cl.Buffer(Float32, ctx, length(testarray),
-                        cl.CL_MEM_COPY_HOST_PTR | cl.CL_MEM_WRITE_ONLY;
-                        hostbuf=testarray) != nothing
-
-        @test cl.Buffer(Float32, ctx, length(testarray),
-                        cl.CL_MEM_COPY_HOST_PTR | cl.CL_MEM_READ_WRITE;
-                        hostbuf=testarray) != nothing
-
-        buf = cl.Buffer(Float32, ctx, length(testarray),
-                        cl.CL_MEM_COPY_HOST_PTR | cl.CL_MEM_READ_WRITE;
-                        hostbuf=testarray)
-        @test length(buf) == length(testarray)
-
-        @test cl.Buffer(Float32, ctx, length(testarray),
-                        cl.CL_MEM_USE_HOST_PTR | cl.CL_MEM_READ_ONLY;
-                        hostbuf=testarray) != nothing
-
-        @test cl.Buffer(Float32, ctx, length(testarray),
-                        cl.CL_MEM_USE_HOST_PTR | cl.CL_MEM_WRITE_ONLY;
-                        hostbuf=testarray) != nothing
-
-        @test cl.Buffer(Float32, ctx, length(testarray),
-                        cl.CL_MEM_USE_HOST_PTR | cl.CL_MEM_READ_WRITE;
-                        hostbuf=testarray) != nothing
-
-        buf = cl.Buffer(Float32, ctx, length(testarray),
-                        cl.CL_MEM_USE_HOST_PTR | cl.CL_MEM_READ_WRITE;
-                        hostbuf=testarray)
-        @test length(buf) == length(testarray)
-
-        # invalid buffer size should throw error
-        @test_throws cl.CLError cl.Buffer(Float32, ctx, +0, cl.CL_MEM_ALLOC_HOST_PTR)
-        @test_throws InexactError cl.Buffer(Float32, ctx, -1, cl.CL_MEM_ALLOC_HOST_PTR)
-
-        # invalid flag combinations should throw error
-        @test_throws cl.CLError cl.Buffer(Float32, ctx, length(testarray),
-                                          cl.CL_MEM_USE_HOST_PTR | cl.CL_MEM_ALLOC_HOST_PTR;
-                                          hostbuf=testarray)
-
-        # invalid host pointer should throw error
-        @test_throws TypeError cl.Buffer(Float32, ctx, 1, cl.CL_MEM_COPY_HOST_PTR;
-                                         hostbuf=C_NULL)
-
-        @test_throws TypeError cl.Buffer(Float32, ctx, 1, cl.CL_MEM_USE_HOST_PTR,
-                                         hostbuf=C_NULL)
-     end
-
-     @testset "constructors symbols" begin
-         ctx = cl.Context(device)
-
-         for mf1 in [:rw, :r, :w]
-             for mf2 in [:copy, :use, :alloc, :null]
-                 for mtype in [cl.Cchar,
-                               cl.Cuchar,
-                               cl.Cshort,
-                               cl.Cushort,
-                               Cint,
-                               cl.Cuint,
-                               cl.Clong,
-                               cl.Culong,
-                               Float16,
-                               Cfloat,
-                               Cdouble,
-                               #TODO: bool, vector_types, struct_types...
-                               ]
-                     testarray = zeros(mtype, 100)
-                     if mf2 == :copy || mf2 == :use
-                         @test cl.Buffer(mtype, ctx, length(testarray), (mf1, mf2);
-                                         hostbuf=testarray) != nothing
-                         buf = cl.Buffer(mtype, ctx, length(testarray), (mf1, mf2);
-                                         hostbuf=testarray)
-                         @test length(buf) == length(testarray)
-                     elseif mf2 == :alloc
-                         @test cl.Buffer(mtype, ctx, length(testarray),
-                                         (mf1, mf2)) != nothing
-                         buf = cl.Buffer(mtype, ctx, length(testarray), (mf1, mf2))
-                         @test length(buf) == length(testarray)
-                     end
-                 end
-             end
-         end
-
-         test_array = Vector{TestStruct}(undef, 100)
-         @test cl.Buffer(TestStruct, ctx, length(test_array), :alloc) != nothing
-         @test cl.Buffer(TestStruct, ctx, length(test_array), :copy;
-                         hostbuf=test_array) != nothing
-
-         # invalid buffer size should throw error
-         @test_throws cl.CLError cl.Buffer(Float32, ctx, +0, :alloc)
-         @test_throws InexactError cl.Buffer(Float32, ctx, -1, :alloc)
-
-         # invalid flag combinations should throw error
-         @test_throws ArgumentError cl.Buffer(Float32, ctx, length(test_array),
-                                              (:use, :alloc), hostbuf=test_array)
-
-         # invalid host pointer should throw error
-         @test_throws TypeError cl.Buffer(Float32, ctx, 1, :copy, hostbuf=C_NULL)
-
-         @test_throws TypeError cl.Buffer(Float32, ctx, 1, :use, hostbuf=C_NULL)
-     end
-
-    @testset "fill" begin
-        ctx = cl.Context(device)
-        queue = cl.CmdQueue(ctx)
-        testarray = zeros(Float32, 1000)
-        buf = cl.Buffer(Float32, ctx, length(testarray), (:rw, :copy), hostbuf=testarray)
-        @test length(buf) == length(testarray)
-
-        cl.fill!(queue, buf, 1f0)
-        readback = cl.read(queue, buf)
-        @test all(x -> x == 1.0, readback)
-        @test all(x -> x == 0.0, testarray)
-        @test buf.valid == true
+@testset "SVMBuffer" begin
+    # simple buffer
+    let buf = cl.SVMBuffer{Int}(1)
+        @test ndims(buf) == 1
+        @test eltype(buf) == Int
+        @test length(buf) == 1
+        @test sizeof(buf) == sizeof(Int)
     end
 
-    @testset "write!" begin
-        ctx = cl.Context(device)
-        queue = cl.CmdQueue(ctx)
-        testarray = zeros(Float32, 1000)
-        buf = cl.Buffer(Float32, ctx, length(testarray), (:rw, :copy); hostbuf=testarray)
-        @test length(buf) == length(testarray)
-        cl.write!(queue, buf, ones(Float32, length(testarray)))
-        readback = cl.read(queue, buf)
-        @test all(x -> x == 1.0, readback) == true
-        @test buf.valid == true
+    # memory copy
+    let buf = cl.SVMBuffer{Int}(1)
+        ptr = pointer(buf)
+
+        src = [42]
+        cl.enqueue_svm_memcpy(ptr, pointer(src), sizeof(src))
+
+        dst = [0]
+        cl.enqueue_svm_memcpy(pointer(dst), ptr, sizeof(dst); blocking=true)
+        @test dst == [42]
     end
 
-    @testset "empty_like" begin
-        ctx = cl.Context(device)
-        queue = cl.CmdQueue(ctx)
-        testarray = zeros(Float32, 1000)
-        buf = cl.Buffer(Float32, ctx, length(testarray), (:rw, :copy); hostbuf=testarray)
+    # memory map
+    let buf = cl.SVMBuffer{Int}(1)
+        ptr = pointer(buf)
 
-        @test sizeof(cl.empty_like(ctx, buf)) == sizeof(testarray)
+        src = [42]
+        cl.enqueue_svm_memcpy(ptr, pointer(src), sizeof(src))
+
+        evt = cl.enqueue_svm_map(ptr, sizeof(src), :rw)
+        wait(evt)
+        mapped = unsafe_wrap(Array, ptr, 1; own=false)
+        @test mapped[] == 42
+        mapped[] = 100
+        cl.enqueue_svm_unmap(ptr) |> cl.wait
+
+        dst = [0]
+        cl.enqueue_svm_memcpy(pointer(dst), ptr, sizeof(dst); blocking=true)
+        @test dst == [100]
     end
 
-    @testset "copy!" begin
-        ctx = cl.Context(device)
-        queue = cl.CmdQueue(ctx)
-        test_array = fill(2f0, 1000)
-        a_buf = cl.Buffer(Float32, ctx, length(test_array))
-        b_buf = cl.Buffer(Float32, ctx, length(test_array))
-        c_arr = Vector{Float32}(undef, length(test_array))
-        # host to device buffer
-        cl.copy!(queue, a_buf, test_array)
-        # device buffer to device buffer
-        cl.copy!(queue, b_buf, a_buf)
-        # device buffer to host
-        cl.copy!(queue, c_arr, b_buf)
-        @test all(x -> isapprox(x, 2.0), c_arr) == true
-    end
+    # fill
+    let buf = cl.SVMBuffer{Int}(3)
+        ptr = pointer(buf)
 
-    @testset "map/unmap" begin
-        ctx = cl.Context(device)
-        queue = cl.CmdQueue(ctx)
-        b = cl.Buffer(Float32, ctx, 100, :rw)
-        for f in (:r, :w, :rw)
-            a, evt = cl.enqueue_map_mem(queue, b, f, 0, (10,10))
-            cl.wait(evt)
-            @test size(a) == (10,10)
-            @test typeof(a) == Array{Float32,2}
+        cl.enqueue_svm_fill(ptr, 42, 3)
 
-            # cannot unmap a buffer without same host array
-            bad = similar(a)
-            @test_throws ArgumentError cl.unmap!(queue, b, bad)
-
-            @test cl.ismapped(b) == true
-            cl.unmap!(queue, b, a)
-            @test cl.ismapped(b) == false
-
-            # cannot unmap an unmapped buffer
-            @test_throws ArgumentError cl.unmap!(queue, b, a)
-
-            # gc here quickly force any memory errors
-            Base.GC.gc()
-        end
-        @test cl.ismapped(b) == false
-        a, evt = cl.enqueue_map_mem(queue, b, :rw, 0, (10,10))
-        @test cl.ismapped(b) == true
-        evt = cl.enqueue_unmap_mem(queue, b, a, wait_for=evt)
-        cl.wait(evt)
-        @test cl.ismapped(b) == false
+        dst = Vector{Int}(undef, 3)
+        cl.enqueue_svm_memcpy(pointer(dst), ptr, sizeof(dst); blocking=true)
+        @test dst == [42,42,42]
     end
 end

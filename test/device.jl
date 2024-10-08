@@ -4,18 +4,18 @@
                            cl.CL_DEVICE_TYPE_ACCELERATOR, cl.CL_DEVICE_TYPE_ALL),
                           (:gpu, :cpu, :accelerator, :all))
 
-            #for (dk, dt) in zip(cl.devices(platform, k), cl.devices(platform, t))
+            #for (dk, dt) in zip(cl.devices(cl.platform(), k), cl.devices(cl.platform(), t))
             #    @fact dk == dt --> true
             #end
-            #devices = cl.devices(platform, k)
+            #devices = cl.devices(cl.platform(), k)
             #for device in devices
-            #    @fact device[:device_type] == t --> true
+            #    @fact device.device_type == t --> true
             #end
         end
     end
 
     @testset "Equality" begin
-        devices = cl.devices(platform)
+        devices = cl.devices(cl.platform())
 
         if length(devices) > 1
             d1 = devices[1]
@@ -36,10 +36,6 @@
                 :name,
                 :device_type,
                 :has_image_support,
-                :queue_properties,
-                :has_queue_out_of_order_exec,
-                :has_queue_profiling,
-                :has_native_kernel,
                 :vendor_id,
                 :max_compute_units,
                 :max_work_item_size,
@@ -61,27 +57,35 @@
                 :max_image2d_shape,
                 :max_image3d_shape,
             ]
-        @test isa(platform, cl.Platform)
-        @test_throws ArgumentError platform[:zjdlkf]
+        @test isa(cl.platform(), cl.Platform)
+        @test_throws ErrorException cl.platform().zjdlkf
 
+        device = cl.device()
         @test isa(device, cl.Device)
-        @test_throws ArgumentError device[:zjdlkf]
+        @test_throws ErrorException device.zjdlkf
         for k in device_info_keys
-            @test device[k] == cl.info(device, k)
+            v = getproperty(device, k)
             if k == :extensions
-                @test isa(device[k], Array)
-                if length(device[k]) > 0
-                    @test isa(device[k], Array{String, 1})
+                @test isa(v, Array)
+                if length(v) > 0
+                    @test isa(v, Array{String, 1})
                 end
             elseif k == :platform
-                @test device[k] == platform
+                @test v == cl.platform()
             elseif k == :max_work_item_sizes
-                @test length(device[k]) == 3
+                @test length(v) == 3
             elseif k == :max_image2d_shape
-                @test length(device[k]) == 2
+                @test length(v) == 2
             elseif k == :max_image3d_shape
-                @test length(device[k]) == 3
+                @test length(v) == 3
             end
         end
+
+        @test cl.queue_properties(cl.device()).profiling isa Bool
+        @test cl.queue_properties(cl.device()).out_of_order_exec isa Bool
+
+        @test cl.exec_capabilities(cl.device()).native_kernel isa Bool
+
+        @test cl.svm_capabilities(cl.device()).fine_grain_buffer isa Bool
     end
 end

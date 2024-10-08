@@ -42,63 +42,61 @@ function cl_performance(ndatapts::Integer, nworkers::Integer)
     @printf("Julia Execution time: %.4f seconds\n", t2 - t1)
 
     for platform in cl.platforms()
-
-        if platform[:name] == "Portable Computing Language"
-            @warn("Portable Computing Language platform not yet supported")
-            continue
-        end
+        cl.platform!(platform)
 
         for device in cl.available_devices(platform)
+            cl.device!(device)
+
             @printf("====================================================\n")
-            @printf("Platform name:    %s\n",  platform[:name])
-            @printf("Platform profile: %s\n",  platform[:profile])
-            @printf("Platform vendor:  %s\n",  platform[:vendor])
-            @printf("Platform version: %s\n",  platform[:version])
+            @printf("Platform name:    %s\n",  platform.name)
+            @printf("Platform profile: %s\n",  platform.profile)
+            @printf("Platform vendor:  %s\n",  platform.vendor)
+            @printf("Platform version: %s\n",  platform.version)
             @printf("----------------------------------------------------\n")
-            @printf("Device name: %s\n", device[:name])
-            @printf("Device type: %s\n", device[:device_type])
-            @printf("Device mem: %i MB\n",           device[:global_mem_size] / 1024^2)
-            @printf("Device max mem alloc: %i MB\n", device[:max_mem_alloc_size] / 1024^2)
-            @printf("Device max clock freq: %i MHZ\n",  device[:max_clock_frequency])
-            @printf("Device max compute units: %i\n",   device[:max_compute_units])
-            @printf("Device max work group size: %i\n", device[:max_work_group_size])
-            @printf("Device max work item size: %s\n",  device[:max_work_item_size])
+            @printf("Device name: %s\n", device.name)
+            @printf("Device type: %s\n", device.device_type)
+            @printf("Device mem: %i MB\n",           device.global_mem_size / 1024^2)
+            @printf("Device max mem alloc: %i MB\n", device.max_mem_alloc_size / 1024^2)
+            @printf("Device max clock freq: %i MHZ\n",  device.max_clock_frequency)
+            @printf("Device max compute units: %i\n",   device.max_compute_units)
+            @printf("Device max work group size: %i\n", device.max_work_group_size)
+            @printf("Device max work item size: %s\n",  device.max_work_item_size)
 
-            if device[:max_mem_alloc_size] < sizeof(Float32) * ndatapts
+            if device.max_mem_alloc_size < sizeof(Float32) * ndatapts
                 @warn("Requested buffer size exceeds device max alloc size!")
-                @warn("Skipping device $(device[:name])...")
+                @warn("Skipping device $(device.name)...")
                 continue
             end
 
-            if device[:max_work_group_size] < nworkers
+            if device.max_work_group_size < nworkers
                 @warn("Number of workers exceeds the device's max work group size!")
-                @warn("Skipping device $(device[:name])...")
+                @warn("Skipping device $(device.name)...")
                 continue
             end
 
-            ctx   = cl.Context(device)
-            queue = cl.CmdQueue(ctx, :profile)
+            da = CLArray(a; access=:r)
+            db = CLArray(b; access=:r)
+            dc = CLArray{Float32}(undef, length(a); access=:w)
 
-            a_buf = cl.Buffer(Float32, ctx, length(a), (:r, :copy), hostbuf=a)
-            b_buf = cl.Buffer(Float32, ctx, length(b), (:r, :copy), hostbuf=b)
-            c_buf = cl.Buffer(Float32, ctx, length(a), :w)
-
-            prg  = cl.Program(ctx, source=bench_kernel) |> cl.build!
+            prg  = cl.Program(source=bench_kernel) |> cl.build!
             kern = cl.Kernel(prg, "sum")
 
-            # work_group_multiple = kern[:prefered_work_group_size_multiple]
+            # work_group_multiple = kern.prefered_work_group_size_multiple
             global_size = (ndatapts,)
             local_size  = (nworkers,)
 
-            # call the kernel
-            evt = kern[queue, global_size, local_size](a_buf, b_buf, c_buf)
+            cl.queue!(:profile) do
+                # call the kernel
+                evt = clcall(kern, Tuple{Ptr{Float32}, Ptr{Float32}, Ptr{Float32}},
+                             da, db, dc; global_size, local_size)
+                wait(evt)
 
-            # duration in ns
-            t = evt[:profile_duration] * 1e-9
-            @printf("Execution time of test: %.4f seconds\n", t)
+                # duration in ns
+                t = evt.profile_duration * 1e-9
+                @printf("Execution time of test: %.4f seconds\n", t)
 
-            c_device = cl.read(queue, c_buf)
-            @info("Result norm: $(norm(c - c_device))")
+                @info("Result norm: $(norm(c - Array(dc)))")
+            end
         end
     end
 end

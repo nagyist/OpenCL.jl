@@ -1,9 +1,3 @@
-#=
-info(
-"======================================================================
-                              Running Behavior Tests
-      ======================================================================")
-=#
 @testset "Hello World Test" begin
     hello_world_kernel = "
         #pragma OPENCL EXTENSION cl_khr_byte_addressable_store : enable
@@ -18,19 +12,16 @@ info(
     hello_world_str = "hello world"
 
 
-    ctx   = cl.Context(device)
-    queue = cl.CmdQueue(ctx)
-
     str_len  = length(hello_world_str) + 1
-    out_buf  = cl.Buffer(Cchar, ctx, sizeof(Cchar) * str_len, :w)
+    out_arr = CLArray{Cchar}(undef, str_len)
 
-    prg   = cl.Program(ctx, source=hello_world_kernel) |> cl.build!
+    prg   = cl.Program(source=hello_world_kernel) |> cl.build!
     kern  = cl.Kernel(prg, "hello")
 
-    queue(kern, str_len, nothing, out_buf)
-    h = cl.read(queue, out_buf)
+    clcall(kern, Tuple{Ptr{Cchar}}, out_arr; global_size=str_len)
+    h = Array(out_arr)
 
-    @test cl.CLString(h) == hello_world_str
+    @test hello_world_str == GC.@preserve h unsafe_string(pointer(h))
 end
 
 @testset "Low Level API Test" begin
@@ -67,15 +58,12 @@ end
     err_code = Ref{cl.Cint}()
 
     # create compute context (TODO: fails if function ptr's not passed...)
-    ctx_id = cl.clCreateContext(C_NULL, 1, [device.id],
-                                    C_NULL,
-                                    C_NULL,
-                                    err_code)
+    ctx_id = cl.clCreateContext(C_NULL, 1, [cl.device().id], C_NULL, C_NULL, err_code)
     if err_code[] != cl.CL_SUCCESS
         throw(cl.CLError(err_code[]))
     end
 
-    q_id = cl.clCreateCommandQueue(ctx_id, device.id, 0, err_code)
+    q_id = cl.clCreateCommandQueue(ctx_id, cl.device(), 0, err_code)
     if err_code[] != cl.CL_SUCCESS
         error("Failed to create command queue")
     end
@@ -168,46 +156,46 @@ end
     end
 end
 
-struct Params
-    A::Float32
-    B::Float32
-    #TODO: fixed size arrays?
-    X1::Float32
-    X2::Float32
-    C::Int32
-    Params(a, b, x, c) = begin
-        new(Float32(a),
-            Float32(b),
-            Float32(x[1]),
-            Float32(x[2]),
-            Int32(c))
-    end
-end
-
-let test_struct = "
-    typedef struct Params
-    {
-        float A;
-        float B;
-        float x[2];  //padding
-        int C;
-    } Params;
-
-
-    __kernel void part3(__global const float *a,
-                        __global const float *b,
-                        __global float *c,
-                        __constant struct Params* test)
-    {
-        int gid = get_global_id(0);
-        c[gid] = test->A * a[gid] + test->B * b[gid] + test->C;
-    }
-"
-
 @testset "Struct Buffer Test" begin
-    ctx = cl.Context(device)
-    q   = cl.CmdQueue(ctx)
-    p   = cl.Program(ctx, source=test_struct) |> cl.build!
+    test_struct = "
+        typedef struct Params
+        {
+            float A;
+            float B;
+            float x[2];  //padding
+            int C;
+        } Params;
+
+
+        __kernel void part3(__global const float *a,
+                            __global const float *b,
+                            __global float *c,
+                            __global struct Params* test)
+        {
+            int gid = get_global_id(0);
+            c[gid] = test->A * a[gid] + test->B * b[gid] + test->C;
+        }
+    "
+
+    Params = @eval(module $(gensym("KernelTest"))
+            struct Params
+                A::Float32
+                B::Float32
+                #TODO: fixed size arrays?
+                X1::Float32
+                X2::Float32
+                C::Int32
+                Params(a, b, x, c) = begin
+                    new(Float32(a),
+                        Float32(b),
+                        Float32(x[1]),
+                        Float32(x[2]),
+                        Int32(c))
+                end
+            end
+        end).Params
+
+    p   = cl.Program(source=test_struct) |> cl.build!
 
     part3 = cl.Kernel(p, "part3")
 
@@ -217,61 +205,56 @@ let test_struct = "
     P = [Params(0.5, 10.0, [0.0, 0.0], 3)]
 
     #TODO: constructor for single immutable types.., check if passed parameter isbits
-    P_buf = cl.Buffer(Params, ctx, length(P), :r)
-    cl.write!(q, P_buf, P)
+    P_arr = CLArray(P; access=:r)
 
-    X_buf = cl.Buffer(Float32, ctx, length(X), (:r, :copy), hostbuf=X)
-    Y_buf = cl.Buffer(Float32, ctx, length(Y), (:r, :copy), hostbuf=Y)
-    R_buf = cl.Buffer(Float32, ctx, length(X), :w)
+    X_arr = CLArray(X; access=:r)
+    Y_arr = CLArray(Y; access=:r)
+    R_arr = CLArray{Float32}(undef, 10; access=:w)
 
     global_size = size(X)
-    q(part3, global_size, nothing, X_buf, Y_buf, R_buf, P_buf)
+    clcall(part3, Tuple{Ptr{Float32}, Ptr{Float32}, Ptr{Float32}, Ptr{Params}},
+                  X_arr, Y_arr, R_arr, P_arr; global_size)
 
-    r = cl.read(q, R_buf)
+    r = Array(R_arr)
     @test all(x -> x == 13.5, r)
 end
 
-end
-
-mutable struct MutableParams
-    A::Float32
-    B::Float32
-end
-
-
-let test_mutable_pointerfree = "
-    typedef struct Params
-    {
-        float A;
-        float B;
-    } Params;
-
-
-    __kernel void part3(
-        __global float *a,
-        Params test
-    ){
-        a[0] = test.A;
-        a[1] = test.B;
-    }
-"
-
 
 @testset "Struct Buffer Test" begin
-    ctx = cl.Context(device)
-    q   = cl.CmdQueue(ctx)
-    p   = cl.Program(ctx, source=test_mutable_pointerfree) |> cl.build!
+    test_mutable_pointerfree = "
+        typedef struct Params
+        {
+            float A;
+            float B;
+        } Params;
+
+
+        __kernel void part3(
+            __global float *a,
+            Params test
+        ){
+            a[0] = test.A;
+            a[1] = test.B;
+        }
+    "
+
+    MutableParams = @eval(module $(gensym("KernelTest"))
+            mutable struct MutableParams
+                A::Float32
+                B::Float32
+            end
+        end).MutableParams
+
+    p   = cl.Program(source=test_mutable_pointerfree) |> cl.build!
 
     part3 = cl.Kernel(p, "part3")
 
     P = MutableParams(0.5, 10.0)
-    P_buf = cl.Buffer(Float32, ctx, 2, :w)
-    q(part3, 1, nothing, P_buf, P)
+    P_arr = CLArray{Float32}(undef, 2)
+    clcall(part3, Tuple{Ptr{Float32}, MutableParams}, P_arr, P)
 
-    r = cl.read(q, P_buf)
+    r = Array(P_arr)
 
     @test r[1] == 0.5
     @test r[2] == 10.0
-end
-
 end
